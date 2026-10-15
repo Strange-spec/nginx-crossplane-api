@@ -1,0 +1,12 @@
+services:
+  nginx-crossplane-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nginx-crossplane-api:latest
+    container_name: nginx-crossplane-api
+    ports:
+      - "8090:8080"
+    restart: unless-stopped
+    environment:
+      - PORT=8080
