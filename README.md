@@ -1,19 +1,26 @@
-# NGINX Crossplane Config Checker API (Docker)
+# NGINX Crossplane Config Checker API (Docker v1.2)
 
-基于官方 [`nginxinc/crossplane`](https://github.com/nginxinc/crossplane) 构建的容器化 NGINX / NGINX Plus 配置文件静态检查与 AST 解析 API 服务。
+基于官方 [`nginxinc/crossplane`](https://github.com/nginxinc/crossplane) + 深度语义分析引擎 + 真实 `nginx -t` 沙盒构建的容器化 NGINX / NGINX Plus 配置文件静态检查与 AST 解析 API 服务。
 
-## 核心增强特性（解决 NIM `nginx-go-crossplane` 静态分析缺陷）
+## 核心增强特性（解决 NIM `nginx-go-crossplane` 静态分析缺陷 + 真实运行时双保险）
 
 1. **跨行漏写分号（`;`）吞并下一行指令检测 (`missing_semicolon`)**：
    - 修复原生 `crossplane` / `nginx-go-crossplane` 将漏写分号的 `server 10.21.123.12:443` 下一行的 `sticky cookie ...` 误判为 `server` 附加参数（False Negative）的缺陷。
-2. **`upstream` `server` 参数严格白名单与格式校验 (`upstream_server_parameter`)**：
-   - 对齐 NGINX / NGINX Plus 运行时 `ngx_http_upstream_server` 规范，严格校验 `weight=`、`max_conns=`、`max_fails=`、`fail_timeout=`、`slow_start=`、`backup`、`down`、`resolve`、`drain`、`route=`、`service=`、`sid=` 等参数。
-3. **NGINX Plus R37 最新指令集支持**：
-   - 补全 `http2 on|off;`、`http3`、`quic_*`、`js_import`、`status_zone`、`ntlm`、`random`、`resolver` (in upstream) 等新版本指令。
-4. **配置片段（Snippet）上下文自动识别 (`context: "auto"`)**：
-   - 支持直接传入 `conf.d/*.conf` 片段（如单独的 `upstream { ... }`、`server { ... }`、`location { ... }`）而无需手动包裹 `events {}` / `http {}`。
-5. **修复 `crossplane` Issue #114（文件末尾最后一条指令漏写分号漏报/空报错问题）**。
-6. **内置可视化 Web 检查台 + Swagger 文档 (`/docs`)**。
+   - 支持检测吞并无参指令（如 `internal;`、`ip_hash;`、`least_conn;`）及单参/多参指令。
+2. **`upstream` `server` 参数严格白名单与复合时间格式校验 (`upstream_server_parameter`)**：
+   - 对齐 NGINX / NGINX Plus 运行时 `ngx_http_upstream_server` 规范，严格校验 `weight=`、`max_conns=`、`max_fails=`、`fail_timeout=`、`slow_start=`、`backup`、`down`、`resolve`、`drain`、`route=`、`service=`、`sid=` 等参数，支持 `1m30s` 等复合时间单位。
+3. **多文件结构与 `include conf.d/*.conf` 递归上下文追踪**：
+   - 支持在请求中传入 `files` 数组，自动匹配 `include` 通配符并将父级上下文（如 `http`）传递至子文件进行深度静态检查与 AST 构建。
+4. **容器内置真实 `nginx -t` 沙盒校验 + 外部依赖自动 Mock (`check_runtime` & `mock_externals`)**：
+   - 容器内置 `nginx` 二进制与预生成自签名 SSL 证书；开启 `check_runtime: true` 时自动在隔离沙盒中：
+     - 将缺失的 `ssl_certificate` / `ssl_certificate_key` 等指向沙盒自签名证书；
+     - 自动创建缺失的 `access_log` / `error_log` 目录、`auth_basic_user_file`、`mime.types`；
+     - 自动为片段中未定义的 `proxy_pass` upstream 注入临时占位定义；
+     - 自动对 NGINX Plus 专有指令（`sticky`、`status_zone`、`health_check`、`api` 等）在静态校验通过后做开源版 `nginx -t` 兼容降级。
+5. **NGINX Plus R37 最新指令集支持**：
+   - 补全 `http2 on|off;`、`http3`、`quic_*`、`js_import`、`status_zone`、`health_check`、`match`、`api`、`sticky`、`zone`、`state`、`ntlm`、`random`、`otel_*`、`mgmt` 等指令。
+6. **新增 `/api/v1/format` 一键配置美化接口**。
+7. **内置可视化多文件 Web 检查台 (`NGINX Crossplane Studio`) + Swagger 文档 (`/docs`)**。
 
 ---
 
@@ -21,13 +28,11 @@
 
 ### 方式 1：使用 `docker compose` 直接拉起
 ```bash
-cd nginx-crossplane-api
 docker compose up -d --build
 ```
 
 ### 方式 2：使用 `docker build` & `docker run`
 ```bash
-cd nginx-crossplane-api
 docker build -t nginx-crossplane-api:latest .
 docker run -d --name nginx-crossplane-api -p 8090:8080 nginx-crossplane-api:latest
 ```
@@ -41,73 +46,59 @@ docker run -d --name nginx-crossplane-api -p 8090:8080 nginx-crossplane-api:late
 
 ## API 调用示例
 
-### 1. JSON 方式检查配置 (`POST /api/v1/check`)
+### 1. 单文件检查 + 真实 `nginx -t` 自动 Mock 校验 (`POST /api/v1/check`)
 ```bash
 curl -s -X POST http://localhost:8090/api/v1/check \
   -H "Content-Type: application/json" \
   -d '{
     "config": "upstream upstream_cmp-test123.carizon.work {\n    zone upstream_cmp-test123.carizon.work 64k;\n    server 10.21.123.12:443\n    sticky cookie srv_id expires=1h path=/;\n}",
     "context": "auto",
-    "strict": true
+    "strict": true,
+    "check_runtime": true,
+    "mock_externals": true
   }' | jq .
 ```
 
-**返回结果示例（精准拦截漏写分号及非法参数）：**
-```json
-{
-  "status": "failed",
-  "valid": false,
-  "detected_context": "http",
-  "error_count": 2,
-  "warning_count": 0,
-  "errors": [
-    {
-      "file": "nginx.conf",
-      "line": 3,
-      "error": "directive \"server\" is not terminated by \";\" (swallowed \"sticky\" directive on line 4) in nginx.conf:3",
-      "message": "directive \"server\" is not terminated by \";\" (swallowed \"sticky\" directive on line 4)",
-      "rule": "missing_semicolon",
-      "suggestion": "Add a semicolon \";\" at the end of line 3 before \"sticky\"."
-    },
-    {
-      "file": "nginx.conf",
-      "line": 4,
-      "error": "invalid parameter \"sticky\" in upstream \"server\" directive in nginx.conf:4",
-      "message": "invalid parameter \"sticky\" in upstream \"server\" directive",
-      "rule": "upstream_server_parameter",
-      "suggestion": "Line 3 (\"server 10.21.123.12:443\") is likely missing a trailing semicolon \";\", causing \"sticky\" on line 4 to be parsed as a server parameter."
-    }
-  ]
-}
-```
-
----
-
-## 背景说明：为什么 NIM 2.23.1 静态分析会出现漏报（False Negative）？
-
-在 NGINX Instance Manager (NIM) 2.23.1 中，控制面静态分析依赖 `nginx-go-crossplane`：
-1. **词法/语法器跨行吞并**：NGINX 配置以 `;` 或 `{` 作为指令结束符（换行符仅被视作普通空白字符）。当 `upstream` 块内的 `server 10.21.123.12:443` 漏写结尾 `;` 时，解析器会继续读取下一行的 `sticky cookie srv_id expires=1h path=/;` 直到遇到 `;`，并将整行内容合并为一条拥有 6 个参数的 `server` 指令：
-   - `directive`: `"server"`
-   - `args`: `["10.21.123.12:443", "sticky", "cookie", "srv_id", "expires=1h", "path=/"]`
-2. **位掩码（Bitmask）仅校验参数个数而不校验参数语义**：`crossplane` / `nginx-go-crossplane` 中 `upstream` 下的 `server` 指令掩码包含 `NGX_CONF_1MORE`（允许 1 个或多个参数），但不检查第 2 个起的参数名是否属于合法 `server` 参数，也不检查参数是否跨行吞并了其他指令关键字，从而导致 **NIM 静态分析返回无错误（False Negative）**，直到下发至数据面 `nginx -t` 时才被 `ngx_http_upstream_server` 拒绝。
-
-本项目通过 **AST + Token 行号联合回溯 (`missing_semicolon`)** 与 **`upstream` `server` 参数严格白名单校验 (`upstream_server_parameter`)** 彻底解决该漏报问题，并提供带行内高亮与一键自动补全分号修复的 **NGINX Crossplane Studio** Web 工作台。
-
-### 2. 直接上传本地配置文件检查 (`Content-Type: text/plain`)
+### 2. 多文件 `include conf.d/*.conf` 检查 (`POST /api/v1/check`)
 ```bash
-curl -s -X POST "http://localhost:8090/api/v1/check?filename=app.conf" \
-  -H "Content-Type: text/plain" \
-  --data-binary @/path/to/app.conf | jq .
+curl -s -X POST http://localhost:8090/api/v1/check \
+  -H "Content-Type: application/json" \
+  -d '{
+    "filename": "nginx.conf",
+    "files": [
+      {
+        "filename": "nginx.conf",
+        "content": "events { worker_connections 1024; }\nhttp {\n    include mime.types;\n    include conf.d/*.conf;\n}"
+      },
+      {
+        "filename": "conf.d/app.conf",
+        "content": "server {\n    listen 443 ssl;\n    http2 on;\n    ssl_certificate /etc/nginx/ssl/prod.crt;\n    ssl_certificate_key /etc/nginx/ssl/prod.key;\n    location / {\n        proxy_pass https://backend_pool;\n    }\n}"
+      }
+    ],
+    "strict": true,
+    "check_runtime": true,
+    "mock_externals": true
+  }' | jq .
 ```
 
-### 3. 词法分析 Token 流 (`POST /api/v1/lex`)
+### 3. 一键配置格式化美化 (`POST /api/v1/format`)
+```bash
+curl -s -X POST http://localhost:8090/api/v1/format \
+  -H "Content-Type: application/json" \
+  -d '{
+    "config": "upstream backend { server 10.0.0.1:8080 weight=5; keepalive 16; }",
+    "indent": 4
+  }' | jq -r .formatted
+```
+
+### 4. 词法分析 Token 流 (`POST /api/v1/lex`)
 ```bash
 curl -s -X POST http://localhost:8090/api/v1/lex \
   -H "Content-Type: application/json" \
   -d '{"config": "server 10.21.123.12:443;\n"}' | jq .
 ```
 
-### 4. AST 反向生成格式化配置 (`POST /api/v1/build`)
+### 5. AST 反向生成配置 (`POST /api/v1/build`)
 ```bash
 curl -s -X POST http://localhost:8090/api/v1/build \
   -H "Content-Type: application/json" \

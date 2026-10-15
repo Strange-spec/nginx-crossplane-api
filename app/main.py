@@ -1,25 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-FastAPI HTTP Service for NGINX Crossplane Config Checking & Analysis.
+FastAPI HTTP Service for NGINX Crossplane Config Checking & Analysis (v1.2).
 """
 
-from typing import Any, Dict, List
+import shutil
+from typing import Any, Dict, List, Optional
 import crossplane
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .checker import check_nginx_config, lex_string_with_lines
+from .checker import check_nginx_config, format_nginx_config, lex_string_with_lines
 
 
 app = FastAPI(
     title="NGINX Crossplane Config Checker API",
     description=(
-        "REST API for checking, parsing, lexing, and building NGINX / NGINX Plus configurations "
-        "powered by Crossplane with enhanced upstream parameter & missing-semicolon static analysis."
+        "REST API for checking, parsing, lexing, formatting, and runtime-verifying NGINX / NGINX Plus "
+        "configurations powered by Crossplane + Deep Semantic Analyzer + Auto-Mocked `nginx -t`."
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -30,10 +31,15 @@ app.add_middleware(
 )
 
 
+class ConfigFileItem(BaseModel):
+    filename: str = Field(..., description="Relative path or filename (e.g. 'nginx.conf' or 'conf.d/app.conf').")
+    content: str = Field(..., description="Configuration file content.")
+
+
 class CheckRequest(BaseModel):
-    config: str = Field(
-        ...,
-        description="Raw NGINX configuration text or snippet to analyze.",
+    config: Optional[str] = Field(
+        default=None,
+        description="Raw NGINX configuration text or snippet to analyze (optional if `files` is provided).",
         json_schema_extra={
             "example": (
                 "upstream upstream_cmp-test123.carizon.work {\n"
@@ -44,16 +50,24 @@ class CheckRequest(BaseModel):
             )
         },
     )
-    filename: str = Field(default="nginx.conf", description="Virtual filename used in error messages.")
+    filename: str = Field(default="nginx.conf", description="Main entry filename.")
+    files: Optional[List[ConfigFileItem]] = Field(
+        default=None,
+        description="Optional multi-file configuration array supporting `include conf.d/*.conf`.",
+    )
     context: str = Field(
         default="auto",
-        description="Starting context: 'auto' (detects snippets like upstream/server), 'main', 'http', 'stream', 'server', or 'upstream'.",
+        description="Starting context: 'auto' (detects snippets like upstream/server), 'main', 'http', 'stream', 'server', 'upstream', or 'location'.",
     )
     strict: bool = Field(default=True, description="Fail on unknown directives.")
     comments: bool = Field(default=False, description="Include comments in parsed AST output.")
     check_runtime: bool = Field(
         default=False,
-        description="Also run `nginx -t` binary check.",
+        description="Also run real `nginx -t` binary verification in an isolated sandbox.",
+    )
+    mock_externals: bool = Field(
+        default=True,
+        description="Automatically mock missing SSL certificates, keys, log directories, undefined upstreams, and NGINX Plus directives during `nginx -t`.",
     )
 
 
@@ -63,23 +77,36 @@ class BuildRequest(BaseModel):
     tabs: bool = Field(default=False, description="Use tabs instead of spaces.")
 
 
+class FormatRequest(BaseModel):
+    config: str = Field(..., description="Raw NGINX configuration text to format.")
+    filename: str = Field(default="nginx.conf", description="Virtual filename.")
+    indent: int = Field(default=4, description="Indentation spaces.")
+    tabs: bool = Field(default=False, description="Use tabs instead of spaces.")
+    comments: bool = Field(default=True, description="Preserve comments when formatting.")
+
+
 @app.get("/health", summary="Health Check")
 async def health() -> Dict[str, Any]:
+    nginx_bin = shutil.which("nginx")
     return {
         "status": "healthy",
         "service": "nginx-crossplane-api",
+        "version": "1.2.0",
         "crossplane_version": getattr(crossplane, "__version__", "0.5.8"),
+        "nginx_binary_available": bool(nginx_bin),
         "features": [
-            "crossplane_lex_parse_build",
+            "crossplane_lex_parse_build_format",
+            "multi_file_include_resolution",
             "nginx_plus_r37_directives",
             "upstream_server_parameter_validation",
             "multiline_missing_semicolon_detection",
             "auto_snippet_context_detection",
+            "nginx_t_runtime_sandbox_with_auto_mock",
         ],
     }
 
 
-@app.post("/api/v1/check", summary="Check & Analyze NGINX Config (JSON or text/plain)")
+@app.post("/api/v1/check", summary="Check & Analyze NGINX Config (Single-File, Multi-File, or text/plain)")
 @app.post("/api/v1/analyze", summary="Alias for /api/v1/check")
 async def api_check_config(
     request: Request,
@@ -88,6 +115,7 @@ async def api_check_config(
     strict: bool = Query(default=True, description="Strict directive checking"),
     comments: bool = Query(default=False, description="Include comments in AST"),
     check_runtime: bool = Query(default=False, description="Run nginx -t runtime test"),
+    mock_externals: bool = Query(default=True, description="Auto-mock certs/dirs during nginx -t"),
 ) -> JSONResponse:
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
@@ -96,6 +124,9 @@ async def api_check_config(
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {e}")
         req = CheckRequest(**body)
+        if req.config is None and not req.files:
+            raise HTTPException(status_code=400, detail="Either 'config' or 'files' must be provided.")
+        files_dicts = [f.model_dump() for f in req.files] if req.files else None
         res = check_nginx_config(
             config_text=req.config,
             filename=req.filename,
@@ -103,6 +134,8 @@ async def api_check_config(
             strict=req.strict,
             comments=req.comments,
             check_runtime=req.check_runtime,
+            mock_externals=req.mock_externals,
+            files=files_dicts,
         )
     else:
         raw_bytes = await request.body()
@@ -116,6 +149,7 @@ async def api_check_config(
             strict=strict,
             comments=comments,
             check_runtime=check_runtime,
+            mock_externals=mock_externals,
         )
 
     return JSONResponse(content=res)
@@ -123,7 +157,9 @@ async def api_check_config(
 
 @app.post("/api/v1/lex", summary="Tokenize NGINX Config into Tokens with Line Numbers")
 async def api_lex_config(req: CheckRequest) -> Dict[str, Any]:
-    tokens, errors = lex_string_with_lines(req.config, filename=req.filename)
+    target_text = req.config or (req.files[0].content if req.files else "")
+    target_name = req.filename or (req.files[0].filename if req.files else "nginx.conf")
+    tokens, errors = lex_string_with_lines(target_text, filename=target_name)
     return {
         "status": "ok" if not errors else "failed",
         "errors": errors,
@@ -146,12 +182,27 @@ async def api_build_config(req: BuildRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Failed to build config from AST: {e}")
 
 
+@app.post("/api/v1/format", summary="Directly Format / Prettify Raw NGINX Config Text")
+async def api_format_config(req: FormatRequest) -> Dict[str, Any]:
+    try:
+        res = format_nginx_config(
+            config_text=req.config,
+            filename=req.filename,
+            indent=req.indent,
+            tabs=req.tabs,
+            comments=req.comments,
+        )
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to format configuration: {e}")
+
+
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>NGINX Crossplane Studio — 配置静态分析与 AST 诊断平台</title>
+  <title>NGINX Crossplane Studio v1.2 — 配置静态分析、多文件 Include 与 nginx -t 诊断平台</title>
   <style>
     :root {
       --bg-base: #070b14;
@@ -193,23 +244,21 @@ INDEX_HTML = """<!DOCTYPE html>
       -webkit-font-smoothing: antialiased;
     }
 
-    /* Top Accent Ribbon */
     .top-ribbon {
       height: 3px;
       background: linear-gradient(90deg, #009639 0%, #10b981 50%, #38bdf8 100%);
     }
 
     .app-shell {
-      max-width: 1520px;
+      max-width: 1540px;
       margin: 0 auto;
       padding: 18px 28px 28px;
       display: flex;
       flex-direction: column;
-      gap: 18px;
+      gap: 16px;
       min-height: calc(100vh - 3px);
     }
 
-    /* Navbar */
     .navbar {
       display: flex;
       justify-content: space-between;
@@ -306,7 +355,6 @@ INDEX_HTML = """<!DOCTYPE html>
       transform: translateY(-1px);
     }
 
-    /* Preset Bar */
     .preset-bar {
       display: flex;
       justify-content: space-between;
@@ -357,8 +405,8 @@ INDEX_HTML = """<!DOCTYPE html>
     .dot-red { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); }
     .dot-amber { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
     .dot-green { width: 8px; height: 8px; border-radius: 50%; background: var(--emerald); }
+    .dot-blue { width: 8px; height: 8px; border-radius: 50%; background: var(--blue); }
 
-    /* Main Split Workspace */
     .workspace {
       display: grid;
       grid-template-columns: 1.05fr 1fr;
@@ -385,17 +433,18 @@ INDEX_HTML = """<!DOCTYPE html>
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 12px 18px;
+      padding: 10px 16px;
       background: rgba(22, 32, 51, 0.65);
       border-bottom: 1px solid var(--border);
+      gap: 8px;
+      flex-wrap: wrap;
     }
 
-    .pane-title {
+    .file-tabs-bar {
       display: flex;
       align-items: center;
-      gap: 10px;
-      font-size: 13.5px;
-      font-weight: 600;
+      gap: 6px;
+      flex-wrap: wrap;
     }
 
     .file-tab {
@@ -403,13 +452,28 @@ INDEX_HTML = """<!DOCTYPE html>
       align-items: center;
       gap: 6px;
       background: var(--bg-editor);
-      border: 1px solid var(--border-light);
-      padding: 4px 11px;
+      border: 1px solid var(--border);
+      padding: 5px 11px;
       border-radius: var(--radius-sm);
       font-family: var(--font-mono);
-      font-size: 12.5px;
-      color: #e2e8f0;
+      font-size: 12px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.15s;
     }
+
+    .file-tab.active {
+      border-color: var(--emerald);
+      color: #fff;
+      background: rgba(16, 185, 129, 0.14);
+    }
+
+    .file-tab .del-file {
+      color: var(--text-muted);
+      font-weight: bold;
+      margin-left: 2px;
+    }
+    .file-tab .del-file:hover { color: var(--danger); }
 
     .toolbar-btns {
       display: flex;
@@ -435,7 +499,6 @@ INDEX_HTML = """<!DOCTYPE html>
       background: #1e293b;
     }
 
-    /* Code Editor with Line Numbers & Line Highlights */
     .editor-wrapper {
       position: relative;
       flex: 1;
@@ -532,7 +595,6 @@ INDEX_HTML = """<!DOCTYPE html>
       tab-size: 4;
     }
 
-    /* Editor Footer Controls */
     .editor-footer {
       display: flex;
       justify-content: space-between;
@@ -554,7 +616,7 @@ INDEX_HTML = """<!DOCTYPE html>
     .ctrl-label {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
+      gap: 5px;
       font-size: 12.5px;
       color: var(--text-secondary);
       cursor: pointer;
@@ -564,9 +626,9 @@ INDEX_HTML = """<!DOCTYPE html>
       background: var(--bg-editor);
       color: var(--text-main);
       border: 1px solid var(--border-light);
-      padding: 6px 10px;
+      padding: 5px 9px;
       border-radius: var(--radius-sm);
-      font-size: 12.5px;
+      font-size: 12px;
       outline: none;
     }
 
@@ -579,7 +641,7 @@ INDEX_HTML = """<!DOCTYPE html>
       font-weight: 600;
       font-size: 13.5px;
       border: none;
-      padding: 9px 20px;
+      padding: 9px 18px;
       border-radius: var(--radius-sm);
       cursor: pointer;
       box-shadow: 0 4px 15px rgba(16, 185, 129, 0.35);
@@ -591,15 +653,6 @@ INDEX_HTML = """<!DOCTYPE html>
       box-shadow: 0 6px 20px rgba(16, 185, 129, 0.5);
     }
 
-    .kbd-hint {
-      font-size: 11px;
-      background: rgba(0, 0, 0, 0.25);
-      padding: 2px 6px;
-      border-radius: 4px;
-      font-family: var(--font-mono);
-    }
-
-    /* Right Pane: KPI Strip + Tabs */
     .kpi-grid {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -623,7 +676,7 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     .kpi-val {
-      font-size: 18px;
+      font-size: 17px;
       font-weight: 700;
       font-family: var(--font-mono);
       display: flex;
@@ -634,9 +687,8 @@ INDEX_HTML = """<!DOCTYPE html>
     .kpi-val.ok { color: #34d399; }
     .kpi-val.fail { color: #f87171; }
     .kpi-val.warn { color: #fbbf24; }
-    .kpi-val.ctx { color: var(--blue); font-size: 15px; }
+    .kpi-val.ctx { color: var(--blue); font-size: 14px; }
 
-    /* Inspector Tabs */
     .tabs-nav {
       display: flex;
       gap: 4px;
@@ -684,25 +736,33 @@ INDEX_HTML = """<!DOCTYPE html>
     .tab-pane { display: none; }
     .tab-pane.active { display: block; }
 
-    /* Diagnostic Cards */
     .empty-pass {
       text-align: center;
-      padding: 48px 20px;
+      padding: 36px 20px;
       background: rgba(16, 185, 129, 0.06);
       border: 1px dashed rgba(16, 185, 129, 0.35);
       border-radius: var(--radius-md);
+      margin-bottom: 14px;
     }
 
     .empty-pass h3 {
-      margin: 12px 0 6px;
+      margin: 10px 0 6px;
       color: #34d399;
-      font-size: 17px;
+      font-size: 16px;
     }
 
     .empty-pass p {
       margin: 0;
       color: var(--text-secondary);
-      font-size: 13.5px;
+      font-size: 13px;
+    }
+
+    .runtime-box {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border-light);
+      border-radius: var(--radius-md);
+      padding: 12px 15px;
+      margin-bottom: 14px;
     }
 
     .diag-card {
@@ -712,12 +772,9 @@ INDEX_HTML = """<!DOCTYPE html>
       border-radius: var(--radius-md);
       padding: 14px 16px;
       margin-bottom: 14px;
-      transition: transform 0.12s ease;
     }
 
-    .diag-card.warning {
-      border-left-color: var(--warn);
-    }
+    .diag-card.warning { border-left-color: var(--warn); }
 
     .diag-header {
       display: flex;
@@ -764,10 +821,6 @@ INDEX_HTML = """<!DOCTYPE html>
       padding: 2px 9px;
       border-radius: 4px;
       cursor: pointer;
-    }
-
-    .badge-line:hover {
-      background: rgba(56, 189, 248, 0.15);
     }
 
     .badge-rule {
@@ -832,11 +885,6 @@ INDEX_HTML = """<!DOCTYPE html>
       flex-shrink: 0;
     }
 
-    .btn-autofix:hover {
-      filter: brightness(1.1);
-    }
-
-    /* AST Tree & Code Blocks */
     .ast-node {
       font-family: var(--font-mono);
       font-size: 13px;
@@ -863,7 +911,6 @@ INDEX_HTML = """<!DOCTYPE html>
       margin: 0;
     }
 
-    /* Token Stream Chips */
     .token-row {
       display: flex;
       align-items: center;
@@ -896,25 +943,22 @@ INDEX_HTML = """<!DOCTYPE html>
       font-weight: 700;
     }
 
-    .tok-chip.quoted {
-      color: #fde047;
-    }
+    .tok-chip.quoted { color: #fde047; }
   </style>
 </head>
 <body>
   <div class="top-ribbon"></div>
 
   <div class="app-shell">
-    <!-- Top Navbar -->
     <nav class="navbar">
       <div class="brand">
         <div class="brand-logo">N</div>
         <div>
           <div class="brand-title">
             NGINX Crossplane Studio
-            <span class="engine-pill"><span class="pulse-dot"></span> Crossplane 0.5.8 + R37 Semantic Engine</span>
+            <span class="engine-pill"><span class="pulse-dot"></span> v1.2 • Crossplane + R37 Semantic + Auto-Mock nginx -t</span>
           </div>
-          <div class="brand-sub">NGINX / NGINX Plus 静态语法检查、跨行漏写分号检测与 Upstream 参数验证平台</div>
+          <div class="brand-sub">支持多文件 Include 解析、跨行漏分号检测、Upstream 参数校验、外部证书/日志自动 Mock 与真实 nginx -t 双重验证</div>
         </div>
       </div>
       <div class="nav-actions">
@@ -923,42 +967,37 @@ INDEX_HTML = """<!DOCTYPE html>
       </div>
     </nav>
 
-    <!-- Scenario Presets Bar -->
     <div class="preset-bar">
       <div class="preset-group">
-        <span class="preset-label">快速测试样例：</span>
-        <button class="preset-btn active" id="btn-preset-bug" onclick="loadPreset('bug', this)">
-          <span class="dot-red"></span> 缺陷复现：server 漏写分号吞并 sticky
+        <span class="preset-label">快速测试场景：</span>
+        <button class="preset-btn active" onclick="loadPreset('bug', this)">
+          <span class="dot-red"></span> 缺陷复现：漏分号吞并 sticky
         </button>
-        <button class="preset-btn" id="btn-preset-param" onclick="loadPreset('param', this)">
-          <span class="dot-red"></span> 参数错误：upstream server 非法参数
+        <button class="preset-btn" onclick="loadPreset('multifile', this)">
+          <span class="dot-blue"></span> 多文件：nginx.conf + include conf.d/*.conf
         </button>
-        <button class="preset-btn" id="btn-preset-warn" onclick="loadPreset('warn', this)">
-          <span class="dot-amber"></span> 规范告警：listen ... http2 废弃写法
+        <button class="preset-btn" onclick="loadPreset('ssl_mock', this)">
+          <span class="dot-green"></span> 证书/依赖自动 Mock + nginx -t
         </button>
-        <button class="preset-btn" id="btn-preset-valid" onclick="loadPreset('valid', this)">
-          <span class="dot-green"></span> 标准配置：NGINX Plus Upstream & Server
+        <button class="preset-btn" onclick="loadPreset('valid', this)">
+          <span class="dot-green"></span> 标准配置：NGINX Plus R37
         </button>
       </div>
       <div class="toolbar-btns">
         <input type="file" id="fileInput" accept=".conf,.txt" style="display:none" onchange="handleFileUpload(event)" />
-        <button class="btn-tool" onclick="document.getElementById('fileInput').click()">📂 导入 .conf 文件</button>
-        <button class="btn-tool" onclick="formatConfig()">✨ 格式化配置 (Build)</button>
-        <button class="btn-tool" onclick="copyConfig()">📋 复制配置</button>
+        <button class="btn-tool" onclick="addNewFileTab()">➕ 新增子文件</button>
+        <button class="btn-tool" onclick="document.getElementById('fileInput').click()">📂 导入文件</button>
+        <button class="btn-tool" onclick="formatConfig()">✨ 一键美化 (/format)</button>
+        <button class="btn-tool" onclick="copyConfig()">📋 复制</button>
       </div>
     </div>
 
-    <!-- Split Workspace -->
     <div class="workspace">
-      <!-- Left: Code Editor -->
       <div class="pane">
         <div class="pane-header">
-          <div class="pane-title">
-            <span class="file-tab" id="fileTabName">📄 nginx.conf</span>
-            <span style="font-size:12px;color:var(--text-muted);" id="editorStats">5 行 | 150 字符</span>
-          </div>
+          <div class="file-tabs-bar" id="fileTabsBar"></div>
           <div class="toolbar-btns">
-            <span style="font-size:12px;color:var(--text-secondary);">支持快捷键 <kbd class="kbd-hint">⌘/Ctrl + Enter</kbd></span>
+            <span style="font-size:12px;color:var(--text-muted);" id="editorStats"></span>
           </div>
         </div>
 
@@ -966,22 +1005,18 @@ INDEX_HTML = """<!DOCTYPE html>
           <div class="gutter" id="lineGutter"></div>
           <div class="editor-stage">
             <div class="highlight-backdrop" id="hlBackdrop"></div>
-            <textarea id="configInput" spellcheck="false" oninput="onEditorInput()" onscroll="syncScroll()">upstream upstream_cmp-test123.carizon.work {
-    zone upstream_cmp-test123.carizon.work 64k;
-    server 10.21.123.12:443
-    sticky cookie srv_id expires=1h path=/;
-}</textarea>
+            <textarea id="configInput" spellcheck="false" oninput="onEditorInput()" onscroll="syncScroll()"></textarea>
           </div>
         </div>
 
         <div class="editor-footer">
           <div class="control-options">
             <label class="ctrl-label">
-              上下文 (Context):
+              上下文:
               <select id="ctxSelect" class="ctrl-select" onchange="runCheck()">
-                <option value="auto" selected>auto (智能识别片段)</option>
-                <option value="main">main (完整 nginx.conf)</option>
-                <option value="http">http (conf.d/*.conf)</option>
+                <option value="auto" selected>auto (智能识别)</option>
+                <option value="main">main (完整配置)</option>
+                <option value="http">http (conf.d)</option>
                 <option value="stream">stream</option>
                 <option value="server">server</option>
                 <option value="upstream">upstream</option>
@@ -989,29 +1024,36 @@ INDEX_HTML = """<!DOCTYPE html>
             </label>
             <label class="ctrl-label">
               <input type="checkbox" id="strictCheck" checked onchange="runCheck()" />
-              Strict 严格指令校验
+              Strict 严格校验
+            </label>
+            <label class="ctrl-label">
+              <input type="checkbox" id="runtimeCheck" checked onchange="runCheck()" />
+              执行真实 <code>nginx -t</code>
+            </label>
+            <label class="ctrl-label">
+              <input type="checkbox" id="mockExternals" checked onchange="runCheck()" />
+              自动 Mock 证书/外部依赖
             </label>
           </div>
           <button class="btn-primary" onclick="runCheck()">
-            ⚡ 立即执行静态分析
+            ⚡ 立即执行检查
           </button>
         </div>
       </div>
 
-      <!-- Right: Multi-Tab Diagnostic Inspector -->
       <div class="pane">
         <div class="kpi-grid">
           <div class="kpi-card">
-            <div class="kpi-label">检查结论 (Status)</div>
+            <div class="kpi-label">综合结论 (Status)</div>
             <div class="kpi-val fail" id="kpiStatus">FAILED</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-label">错误数 (Errors)</div>
+            <div class="kpi-label">静态错误 (Errors)</div>
             <div class="kpi-val fail" id="kpiErrors">0</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-label">告警数 (Warnings)</div>
-            <div class="kpi-val warn" id="kpiWarnings">0</div>
+            <div class="kpi-label">nginx -t 运行时</div>
+            <div class="kpi-val ok" id="kpiRuntime">--</div>
           </div>
           <div class="kpi-card">
             <div class="kpi-label">识别上下文 (Context)</div>
@@ -1021,7 +1063,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
         <div class="tabs-nav">
           <button class="tab-btn active" onclick="switchTab('diag', this)">
-            🛡️ 诊断报告 <span class="tab-count" id="badgeDiagCount">0</span>
+            🛡️ 诊断与 nginx -t <span class="tab-count" id="badgeDiagCount">0</span>
           </button>
           <button class="tab-btn" onclick="switchTab('ast', this)">
             🌳 Crossplane AST
@@ -1035,40 +1077,29 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
 
         <div class="tab-content">
-          <!-- Tab 1: Diagnostics -->
           <div class="tab-pane active" id="tab-diag">
             <div id="diagContainer"></div>
           </div>
 
-          <!-- Tab 2: AST -->
           <div class="tab-pane" id="tab-ast">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-              <span style="font-size:12.5px;color:var(--text-secondary);">Crossplane 解析抽象语法树 (JSON Payload)</span>
+              <span style="font-size:12.5px;color:var(--text-secondary);">Crossplane 多文件 AST 树与完整响应 JSON</span>
               <button class="btn-tool" onclick="copyText(document.getElementById('jsonOutput').textContent)">复制 JSON</button>
             </div>
             <div id="astTreeContainer" style="margin-bottom:14px;"></div>
             <pre class="code-box" id="jsonOutput"></pre>
           </div>
 
-          <!-- Tab 3: Lexer Tokens -->
           <div class="tab-pane" id="tab-tokens">
             <div id="tokenContainer"></div>
           </div>
 
-          <!-- Tab 4: API Snippet -->
           <div class="tab-pane" id="tab-api">
             <div style="margin-bottom:8px;font-size:12.5px;color:var(--text-secondary);display:flex;justify-content:space-between;">
-              <span>1. cURL 命令行调用</span>
+              <span>1. cURL 命令行调用（支持单文件与多文件 JSON）</span>
               <button class="btn-tool" onclick="copyText(document.getElementById('curlSnippet').textContent)">复制 cURL</button>
             </div>
             <pre class="code-box" id="curlSnippet" style="margin-bottom:16px;"></pre>
-
-            <div style="margin-bottom:8px;font-size:12.5px;color:var(--text-secondary);display:flex;justify-content:space-between;">
-              <span>2. 直接上传本地配置文件 (text/plain)</span>
-            </div>
-            <pre class="code-box">curl -s -X POST "http://localhost:8090/api/v1/check?filename=nginx.conf" \\
-  -H "Content-Type: text/plain" \\
-  --data-binary @nginx.conf | jq .</pre>
           </div>
         </div>
       </div>
@@ -1077,12 +1108,42 @@ INDEX_HTML = """<!DOCTYPE html>
 
   <script>
     const PRESETS = {
-      bug: `upstream upstream_cmp-test123.carizon.work {\\n    zone upstream_cmp-test123.carizon.work 64k;\\n    server 10.21.123.12:443\\n    sticky cookie srv_id expires=1h path=/;\\n}`,
-      param: `upstream backend_pool {\\n    zone backend_pool 64k;\\n    server 10.0.0.10:8080 weight=abc invalid_opt=123;\\n    keepalive 32;\\n}`,
-      warn: `server {\\n    listen 443 ssl http2;\\n    server_name api.carizon.work;\\n\\n    location / {\\n        proxy_pass http://upstream_cmp-test123.carizon.work;\\n    }\\n}`,
-      valid: `upstream upstream_cmp-test123.carizon.work {\\n    zone upstream_cmp-test123.carizon.work 64k;\\n    server 10.21.123.12:443 weight=5 max_fails=3 fail_timeout=10s;\\n    sticky cookie srv_id expires=1h path=/;\\n}\\n\\nserver {\\n    listen 443 ssl;\\n    http2 on;\\n    server_name cmp-test123.carizon.work;\\n\\n    location / {\\n        proxy_pass https://upstream_cmp-test123.carizon.work;\\n        status_zone cmp_backend_zone;\\n    }\\n}`
+      bug: [
+        {
+          filename: 'nginx.conf',
+          content: `upstream upstream_cmp-test123.carizon.work {\\n    zone upstream_cmp-test123.carizon.work 64k;\\n    server 10.21.123.12:443\\n    sticky cookie srv_id expires=1h path=/;\\n}`
+        }
+      ],
+      multifile: [
+        {
+          filename: 'nginx.conf',
+          content: `events {\\n    worker_connections 1024;\\n}\\n\\nhttp {\\n    include mime.types;\\n    include conf.d/*.conf;\\n}`
+        },
+        {
+          filename: 'conf.d/upstream.conf',
+          content: `upstream carizon_backend {\\n    zone carizon_backend 64k;\\n    server 10.21.123.12:443 weight=5 fail_timeout=1m30s\\n    keepalive 32;\\n}`
+        },
+        {
+          filename: 'conf.d/server.conf',
+          content: `server {\\n    listen 443 ssl;\\n    http2 on;\\n    server_name cmp.carizon.work;\\n    ssl_certificate /etc/nginx/ssl/prod_carizon.crt;\\n    ssl_certificate_key /etc/nginx/ssl/prod_carizon.key;\\n    location / {\\n        proxy_pass https://carizon_backend;\\n    }\\n}`
+        }
+      ],
+      ssl_mock: [
+        {
+          filename: 'conf.d/ssl_app.conf',
+          content: `server {\\n    listen 443 ssl;\\n    http2 on;\\n    server_name gateway.carizon.work;\\n    ssl_certificate /etc/nginx/ssl/missing_cert.pem;\\n    ssl_certificate_key /etc/nginx/ssl/missing_key.key;\\n    access_log /var/log/nginx/gateway/access.log;\\n    status_zone gw_zone;\\n\\n    location / {\\n        proxy_pass https://unlisted_external_pool;\\n        health_check interval=5s fails=3 passes=2;\\n    }\\n}`
+        }
+      ],
+      valid: [
+        {
+          filename: 'nginx.conf',
+          content: `upstream upstream_cmp-test123.carizon.work {\\n    zone upstream_cmp-test123.carizon.work 64k;\\n    server 10.21.123.12:443 weight=5 max_fails=3 fail_timeout=1m30s;\\n    sticky cookie srv_id expires=1h path=/;\\n}\\n\\nserver {\\n    listen 443 ssl;\\n    http2 on;\\n    server_name cmp-test123.carizon.work;\\n    ssl_certificate /etc/nginx/ssl/cmp.crt;\\n    ssl_certificate_key /etc/nginx/ssl/cmp.key;\\n\\n    location / {\\n        proxy_pass https://upstream_cmp-test123.carizon.work;\\n        status_zone cmp_backend_zone;\\n    }\\n}`
+        }
+      ]
     };
 
+    let filesState = JSON.parse(JSON.stringify(PRESETS.bug));
+    let activeFileIdx = 0;
     let lastCheckData = null;
     let errorLinesMap = new Map();
     let warnLinesMap = new Map();
@@ -1095,16 +1156,73 @@ INDEX_HTML = """<!DOCTYPE html>
         .replace(/"/g, '&quot;');
     }
 
+    function renderFileTabs() {
+      const bar = document.getElementById('fileTabsBar');
+      bar.innerHTML = filesState.map((f, idx) => {
+        const activeCls = idx === activeFileIdx ? 'active' : '';
+        const delBtn = filesState.length > 1
+          ? `<span class="del-file" onclick="deleteFileTab(event, ${idx})" title="删除文件">×</span>`
+          : '';
+        return `<div class="file-tab ${activeCls}" onclick="selectFileTab(${idx})">📄 ${escapeHtml(f.filename)} ${delBtn}</div>`;
+      }).join('');
+    }
+
+    function selectFileTab(idx) {
+      filesState[activeFileIdx].content = document.getElementById('configInput').value;
+      activeFileIdx = idx;
+      document.getElementById('configInput').value = filesState[activeFileIdx].content;
+      renderFileTabs();
+      updateCurrentFileMarkers();
+      renderGutterAndHighlights();
+    }
+
+    function addNewFileTab() {
+      filesState[activeFileIdx].content = document.getElementById('configInput').value;
+      const name = prompt('请输入新配置文件的相对路径（例如 conf.d/app.conf）：', `conf.d/sub_${filesState.length}.conf`);
+      if (!name || !name.trim()) return;
+      filesState.push({
+        filename: name.trim(),
+        content: `server {\\n    listen 80;\\n    server_name example.com;\\n}`
+      });
+      activeFileIdx = filesState.length - 1;
+      document.getElementById('configInput').value = filesState[activeFileIdx].content;
+      renderFileTabs();
+      runCheck();
+    }
+
+    function deleteFileTab(ev, idx) {
+      ev.stopPropagation();
+      if (filesState.length <= 1) return;
+      filesState.splice(idx, 1);
+      if (activeFileIdx >= filesState.length) activeFileIdx = filesState.length - 1;
+      document.getElementById('configInput').value = filesState[activeFileIdx].content;
+      renderFileTabs();
+      runCheck();
+    }
+
     function syncScroll() {
       const ta = document.getElementById('configInput');
       document.getElementById('lineGutter').scrollTop = ta.scrollTop;
       document.getElementById('hlBackdrop').scrollTop = ta.scrollTop;
     }
 
+    function updateCurrentFileMarkers() {
+      errorLinesMap.clear();
+      warnLinesMap.clear();
+      if (!lastCheckData) return;
+      const curFile = filesState[activeFileIdx].filename;
+      (lastCheckData.errors || []).forEach(e => {
+        if ((!e.file || e.file === curFile) && e.line) errorLinesMap.set(e.line, e);
+      });
+      (lastCheckData.warnings || []).forEach(w => {
+        if ((!w.file || w.file === curFile) && w.line) warnLinesMap.set(w.line, w);
+      });
+    }
+
     function renderGutterAndHighlights() {
       const text = document.getElementById('configInput').value;
       const lines = text.split('\\n');
-      document.getElementById('editorStats').textContent = `${lines.length} 行 | ${text.length} 字符`;
+      document.getElementById('editorStats').textContent = `${filesState.length} 个文件 | 当前 ${lines.length} 行`;
 
       let gutterHtml = '';
       let hlHtml = '';
@@ -1123,14 +1241,24 @@ INDEX_HTML = """<!DOCTYPE html>
       syncScroll();
     }
 
+    let editorCheckTimer = null;
+
     function onEditorInput() {
+      filesState[activeFileIdx].content = document.getElementById('configInput').value;
       renderGutterAndHighlights();
+      if (editorCheckTimer) clearTimeout(editorCheckTimer);
+      editorCheckTimer = setTimeout(() => {
+        runCheck();
+      }, 300);
     }
 
     function loadPreset(name, btnEl) {
       document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
       if (btnEl) btnEl.classList.add('active');
-      document.getElementById('configInput').value = PRESETS[name];
+      filesState = JSON.parse(JSON.stringify(PRESETS[name]));
+      activeFileIdx = 0;
+      document.getElementById('configInput').value = filesState[0].content;
+      renderFileTabs();
       runCheck();
     }
 
@@ -1141,7 +1269,11 @@ INDEX_HTML = """<!DOCTYPE html>
       document.getElementById('tab-' + tabId).classList.add('active');
     }
 
-    function jumpToLine(lineNo) {
+    function jumpToFileLine(fileName, lineNo) {
+      const targetIdx = filesState.findIndex(f => f.filename === fileName);
+      if (targetIdx !== -1 && targetIdx !== activeFileIdx) {
+        selectFileTab(targetIdx);
+      }
       const ta = document.getElementById('configInput');
       const lines = ta.value.split('\\n');
       let pos = 0;
@@ -1153,16 +1285,20 @@ INDEX_HTML = """<!DOCTYPE html>
       ta.setSelectionRange(pos, pos + lineLen);
     }
 
-    function autoFixMissingSemicolon(lineNo) {
+    function autoFixMissingSemicolon(fileName, lineNo) {
+      const targetIdx = filesState.findIndex(f => f.filename === fileName);
+      if (targetIdx !== -1 && targetIdx !== activeFileIdx) {
+        selectFileTab(targetIdx);
+      }
       const ta = document.getElementById('configInput');
       const lines = ta.value.split('\\n');
       if (lineNo >= 1 && lineNo <= lines.length) {
-        const raw = lines[lineNo - 1].replace(/\\s+$/, '');
-        if (!raw.endsWith(';')) {
-          lines[lineNo - 1] = raw + ';';
-          ta.value = lines.join('\\n');
-          runCheck();
-        }
+        let cleaned = lines[lineNo - 1].replace(/\\s+$/, '');
+        cleaned = cleaned.replace(/[；;）)（(]+$/, '').replace(/\\s+$/, '');
+        lines[lineNo - 1] = cleaned + ';';
+        ta.value = lines.join('\\n');
+        filesState[activeFileIdx].content = ta.value;
+        runCheck();
       }
     }
 
@@ -1179,21 +1315,43 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     async function runCheck() {
-      const config = document.getElementById('configInput').value;
+      filesState[activeFileIdx].content = document.getElementById('configInput').value;
       const context = document.getElementById('ctxSelect').value;
       const strict = document.getElementById('strictCheck').checked;
-      const lines = config.split('\\n');
+      const check_runtime = document.getElementById('runtimeCheck').checked;
+      const mock_externals = document.getElementById('mockExternals').checked;
+
+      const reqBody = filesState.length === 1
+        ? {
+            config: filesState[0].content,
+            filename: filesState[0].filename,
+            context,
+            strict,
+            check_runtime,
+            mock_externals
+          }
+        : {
+            filename: filesState[0].filename,
+            files: filesState,
+            context,
+            strict,
+            check_runtime,
+            mock_externals
+          };
 
       const [checkResp, lexResp] = await Promise.all([
         fetch('/api/v1/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ config, context, strict })
+          body: JSON.stringify(reqBody)
         }),
         fetch('/api/v1/lex', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ config })
+          body: JSON.stringify({
+            config: filesState[activeFileIdx].content,
+            filename: filesState[activeFileIdx].filename
+          })
         })
       ]);
 
@@ -1201,14 +1359,10 @@ INDEX_HTML = """<!DOCTYPE html>
       const lexData = await lexResp.json();
       lastCheckData = data;
 
-      // Update maps for editor highlights
-      errorLinesMap.clear();
-      warnLinesMap.clear();
-      (data.errors || []).forEach(e => { if (e.line) errorLinesMap.set(e.line, e); });
-      (data.warnings || []).forEach(w => { if (w.line) warnLinesMap.set(w.line, w); });
+      updateCurrentFileMarkers();
       renderGutterAndHighlights();
 
-      // Update KPIs
+      // KPIs
       const kpiStatus = document.getElementById('kpiStatus');
       if (data.valid) {
         kpiStatus.textContent = '✅ PASSED';
@@ -1218,30 +1372,64 @@ INDEX_HTML = """<!DOCTYPE html>
         kpiStatus.className = 'kpi-val fail';
       }
       document.getElementById('kpiErrors').textContent = data.error_count;
-      document.getElementById('kpiWarnings').textContent = data.warning_count;
       document.getElementById('kpiContext').textContent = data.detected_context;
       document.getElementById('badgeDiagCount').textContent = data.error_count + data.warning_count;
 
+      const kpiRuntime = document.getElementById('kpiRuntime');
+      if (data.runtime_check) {
+        if (!data.runtime_check.available) {
+          kpiRuntime.textContent = 'N/A (无二进制)';
+          kpiRuntime.className = 'kpi-val warn';
+        } else if (data.runtime_check.passed) {
+          kpiRuntime.textContent = '✅ PASS';
+          kpiRuntime.className = 'kpi-val ok';
+        } else {
+          kpiRuntime.textContent = '❌ FAIL';
+          kpiRuntime.className = 'kpi-val fail';
+        }
+      } else {
+        kpiRuntime.textContent = '未开启';
+        kpiRuntime.className = 'kpi-val ctx';
+      }
+
       // Render Diagnostics Tab
       const diagContainer = document.getElementById('diagContainer');
+      let html = '';
+
+      if (data.runtime_check) {
+        const rt = data.runtime_check;
+        const badgeColor = rt.passed ? '#34d399' : (rt.available ? '#f87171' : '#fbbf24');
+        const mockedList = (rt.mocked_items || []).map(m => `<li>${escapeHtml(m)}</li>`).join('');
+        html += `
+          <div class="runtime-box">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <strong style="font-size:13px;color:${badgeColor};">🛠️ 真实二进制 <code>nginx -t</code> 沙盒验证：${rt.passed ? '通过 (Syntax is ok & test is successful)' : (rt.available ? '未通过' : '当前宿主未安装 nginx')}</strong>
+            </div>
+            ${rt.output ? `<pre class="code-box" style="padding:8px 10px;font-size:12px;margin-bottom:6px;">${escapeHtml(rt.output)}</pre>` : ''}
+            ${mockedList ? `<div style="font-size:12px;color:var(--text-secondary);"><strong>自动 Mock 的外部依赖 (${rt.mocked_items.length} 项)：</strong><ul style="margin:4px 0 0 18px;padding:0;">${mockedList}</ul></div>` : ''}
+          </div>`;
+      }
+
       if (data.error_count === 0 && data.warning_count === 0) {
-        diagContainer.innerHTML = `
+        html += `
           <div class="empty-pass">
-            <div style="font-size:38px;">🎉</div>
-            <h3>语法与参数校验全部通过</h3>
+            <div style="font-size:34px;">🎉</div>
+            <h3>语法、参数与跨文件校验全部通过</h3>
             <p>未发现漏写分号、上下文错误或非法的 Upstream Server 参数。</p>
           </div>`;
       } else {
-        let html = '';
         (data.errors || []).forEach(err => {
-          const codeLine = err.line && lines[err.line - 1] !== undefined ? lines[err.line - 1] : '';
-          const canAutoFix = err.rule === 'missing_semicolon' && err.line;
+          const fObj = filesState.find(f => f.filename === err.file) || filesState[activeFileIdx];
+          const fLines = fObj ? fObj.content.split('\\n') : [];
+          const codeLine = err.line && fLines[err.line - 1] !== undefined ? fLines[err.line - 1] : '';
+          const canAutoFix = ['missing_semicolon', 'upstream_server_address', 'invalid_character'].includes(err.rule) && err.line;
+          const fixLabel = err.rule === 'missing_semicolon' ? '🔧 一键补全分号' : '🔧 一键清理并修复';
           html += `
             <div class="diag-card">
               <div class="diag-header">
                 <div class="diag-badges">
                   <span class="badge-sev err">ERROR</span>
-                  <span class="badge-line" onclick="jumpToLine(${err.line || 1})">Line ${err.line ?? '?'} ↗</span>
+                  <span class="badge-line" onclick="jumpToFileLine('${escapeHtml(err.file || fObj.filename)}', ${err.line || 1})">${escapeHtml(err.file || 'nginx.conf')}:${err.line ?? '?'} ↗</span>
                   <span class="badge-rule">${escapeHtml(err.rule || 'syntax')}</span>
                 </div>
               </div>
@@ -1250,33 +1438,36 @@ INDEX_HTML = """<!DOCTYPE html>
               ${err.suggestion ? `
                 <div class="diag-Suggest">
                   <span>💡 <strong>修复建议：</strong>${escapeHtml(err.suggestion)}</span>
-                  ${canAutoFix ? `<button class="btn-autofix" onclick="autoFixMissingSemicolon(${err.line})">🔧 一键补全分号</button>` : ''}
+                  ${canAutoFix ? `<button class="btn-autofix" onclick="autoFixMissingSemicolon('${escapeHtml(err.file || fObj.filename)}', ${err.line})">${fixLabel}</button>` : ''}
                 </div>` : ''}
             </div>`;
         });
 
         (data.warnings || []).forEach(w => {
-          const codeLine = w.line && lines[w.line - 1] !== undefined ? lines[w.line - 1] : '';
           html += `
             <div class="diag-card warning">
               <div class="diag-header">
                 <div class="diag-badges">
                   <span class="badge-sev warn">WARNING</span>
-                  <span class="badge-line" onclick="jumpToLine(${w.line || 1})">Line ${w.line ?? '?'} ↗</span>
+                  <span class="badge-line" onclick="jumpToFileLine('${escapeHtml(w.file || 'nginx.conf')}', ${w.line || 1})">${escapeHtml(w.file || 'nginx.conf')}:${w.line ?? '?'} ↗</span>
                   <span class="badge-rule">${escapeHtml(w.rule || 'warning')}</span>
                 </div>
               </div>
               <div class="diag-msg">${escapeHtml(w.message)}</div>
-              ${codeLine ? `<div class="code-preview"><span class="code-preview-ln">${w.line} |</span><span>${escapeHtml(codeLine)}</span></div>` : ''}
               ${w.suggestion ? `<div class="diag-Suggest"><span>💡 <strong>优化建议：</strong>${escapeHtml(w.suggestion)}</span></div>` : ''}
             </div>`;
         });
-        diagContainer.innerHTML = html;
       }
+      diagContainer.innerHTML = html;
 
       // Render AST Tab
-      const parsed = (data.config && data.config[0] && data.config[0].parsed) || [];
-      document.getElementById('astTreeContainer').innerHTML = renderAstTree(parsed);
+      const allConfigs = data.config || [];
+      document.getElementById('astTreeContainer').innerHTML = allConfigs.map(c => `
+        <div style="margin-bottom:10px;">
+          <div style="font-size:12.5px;font-weight:700;color:var(--blue);margin-bottom:4px;">📄 ${escapeHtml(c.file)} (${c.status})</div>
+          ${renderAstTree(c.parsed)}
+        </div>
+      `).join('');
       document.getElementById('jsonOutput').textContent = JSON.stringify(data, null, 2);
 
       // Render Tokens Tab
@@ -1299,25 +1490,26 @@ INDEX_HTML = """<!DOCTYPE html>
       document.getElementById('tokenContainer').innerHTML = tokHtml || '<div style="color:var(--text-muted)">无 Token</div>';
 
       // Render API Tab
-      const payloadStr = JSON.stringify({ config, context, strict }, null, 2);
+      const payloadStr = JSON.stringify(reqBody, null, 2);
       document.getElementById('curlSnippet').textContent =
         `curl -s -X POST http://localhost:8090/api/v1/check \\\\\\n  -H "Content-Type: application/json" \\\\\\n  -d '${payloadStr.replace(/'/g, "'\\\\\\\\''")}' | jq .`;
     }
 
     async function formatConfig() {
-      if (!lastCheckData || !lastCheckData.valid) {
-        alert('请先修复当前配置中的语法错误，再执行 AST 格式化生成。');
-        return;
-      }
-      const parsed = lastCheckData.config[0].parsed;
-      const resp = await fetch('/api/v1/build', {
+      const curText = document.getElementById('configInput').value;
+      const resp = await fetch('/api/v1/format', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ parsed, indent: 4 })
+        body: JSON.stringify({
+          config: curText,
+          filename: filesState[activeFileIdx].filename,
+          indent: 4
+        })
       });
       const res = await resp.json();
-      if (res.config) {
-        document.getElementById('configInput').value = res.config;
+      if (res.formatted) {
+        document.getElementById('configInput').value = res.formatted;
+        filesState[activeFileIdx].content = res.formatted;
         runCheck();
       }
     }
@@ -1325,10 +1517,12 @@ INDEX_HTML = """<!DOCTYPE html>
     function handleFileUpload(e) {
       const file = e.target.files[0];
       if (!file) return;
-      document.getElementById('fileTabName').textContent = '📄 ' + file.name;
       const reader = new FileReader();
       reader.onload = ev => {
+        filesState[activeFileIdx].filename = file.name;
+        filesState[activeFileIdx].content = ev.target.result;
         document.getElementById('configInput').value = ev.target.result;
+        renderFileTabs();
         runCheck();
       };
       reader.readAsText(file);
@@ -1349,7 +1543,11 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     });
 
-    window.addEventListener('DOMContentLoaded', runCheck);
+    window.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('configInput').value = filesState[0].content;
+      renderFileTabs();
+      runCheck();
+    });
   </script>
 </body>
 </html>
